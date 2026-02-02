@@ -4,9 +4,9 @@ Training pipeline for card game identification using Siamese networks.
 
 ## 🚀 Quick Start with Google Colab
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/YOUR_USERNAME/YOUR_REPO/blob/main/Card_Recognition_Training.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Krishan552Patel/Card-recognition-fab/blob/master/Card_Recognition_Training.ipynb)
 
-1. Click the badge above (after pushing to GitHub)
+1. Click the badge above
 2. Enable GPU: `Runtime → Change runtime type → T4 GPU`
 3. Run all cells
 
