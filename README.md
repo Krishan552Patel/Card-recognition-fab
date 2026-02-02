@@ -30,23 +30,20 @@ model/
 
 **DO NOT upload card images to GitHub!** (too large + copyright)
 
-Your data is at:
+Your **original card scans** are at:
 ```
-D:\SIAMESE DATASET\LARGE SCALE OUTPUT\
-├── 66gcPMPfHnNqfQQqz8PCL\    ← Card ID folder
-│   ├── rot_000.png           ← Original
-│   ├── rot_090.png           ← 90° rotation
-│   ├── rot_180.png           ← 180° rotation
-│   └── rot_270.png           ← 270° rotation
-├── 66GnLh6pGrGFpKzckjkhp\
-│   └── ...
-└── ... (13,948 cards total)
+D:\FABIMAGE\
+├── 66gcPMPfHnNqfQQqz8PCL.jpg
+├── 66GnLh6pGrGFpKzckjkhp.jpg
+├── ... (13,978 cards, ~13.7 GB total)
 ```
 
-**Upload to Google Drive** as a ZIP:
-1. Zip `D:\SIAMESE DATASET\LARGE SCALE OUTPUT` → `card_images.zip`
+Rotations and augmentations are created **on-the-fly during training** - no need to pre-generate!
+
+**Upload to Google Drive:**
+1. ZIP is being created at `D:\card_images.zip` (~10-12 GB compressed)
 2. Upload to `MyDrive/CardData/card_images.zip`
-3. Colab will unzip automatically
+3. Colab will extract and create rotations automatically
 
 ## 🔧 Features
 
