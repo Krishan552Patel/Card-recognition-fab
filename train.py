@@ -1,235 +1,155 @@
 """
-Training Script for FAB Card Siamese Network
-With Early Stopping Support
+Standalone training script for the card recognition model.
+
+Usage:
+    python train.py --image-dir /path/to/flat/card/images
+    python train.py --image-dir /path/to/images --output-dir ./checkpoints --epochs 50
+
+Imports from the project modules (backbone, dataset, losses, augmentation, config)
+so that the same code runs identically locally and on cloud GPU (Modal / Colab).
 """
 
+import argparse
+import random
+from pathlib import Path
+
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.cuda.amp import autocast, GradScaler
-from torch.utils.tensorboard import SummaryWriter
-from pathlib import Path
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
-import os
-import argparse
 
-from backbone import create_model
-from arcface_loss import ArcFaceLoss
-from dataset import create_dataloaders, FABCardDataset
 import config
+from augmentation import get_controlled_augmentation, get_val_transforms
+from backbone import CardNet
+from dataset import CardDataset
+from losses import CosFaceLoss
 
 
-def train_epoch(model, train_loader, criterion, optimizer, device, scaler=None):
-    """Train for one epoch."""
+def train_one_epoch(model, loader, criterion, optimizer, scaler, device):
     model.train()
-    running_loss = 0.0
-    
-    pbar = tqdm(train_loader, desc=f"Epoch")
-    for images, labels in pbar:
-        images = images.to(device)
-        labels = labels.to(device)
-        
-        # Forward pass with mixed precision
-        with autocast(enabled=scaler is not None):
-            embeddings = model(images)
-            loss = criterion(embeddings, labels)
-        
-        # Backward pass
+    total_loss = 0.0
+    for images, labels in tqdm(loader, desc="  train", leave=False):
+        images, labels = images.to(device), labels.to(device)
+        with torch.amp.autocast("cuda", enabled=scaler is not None):
+            loss = criterion(model(images), labels)
         optimizer.zero_grad()
-        
-        if scaler:
-            # Mixed precision backward
+        if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            # Gradient clipping for stability
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             scaler.step(optimizer)
             scaler.update()
         else:
-            # Standard backward
             loss.backward()
-            # Gradient clipping for stability
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             optimizer.step()
-        
-        # Statistics
-        running_loss += loss.item()
-        
-        # Update progress bar
-        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-    
-    avg_loss = running_loss / len(train_loader)
-    return avg_loss
+        total_loss += loss.item()
+    return total_loss / len(loader)
 
 
-def validate(model, val_loader, criterion, device):
-    """Validate model."""
+def validate(model, loader, criterion, device):
     model.eval()
-    running_loss = 0.0
-    
+    total_loss = 0.0
     with torch.no_grad():
-        for images, labels in val_loader:
-            images = images.to(device)
-            labels = labels.to(device)
-            
-            embeddings = model(images)
-            loss = criterion(embeddings, labels)
-            
-            running_loss += loss.item()
-    
-    avg_loss = running_loss / len(val_loader)
-    return avg_loss
+        for images, labels in tqdm(loader, desc="  val  ", leave=False):
+            images, labels = images.to(device), labels.to(device)
+            total_loss += criterion(model(images), labels).item()
+    return total_loss / len(loader)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Train card recognition embedding model")
+    parser.add_argument("--image-dir", required=True, help="Flat folder of card images")
+    parser.add_argument("--output-dir", default="./checkpoints", help="Where to save checkpoints")
+    parser.add_argument("--epochs", type=int, default=config.NUM_EPOCHS)
+    parser.add_argument("--batch-size", type=int, default=config.BATCH_SIZE)
+    parser.add_argument("--lr", type=float, default=config.LR)
+    parser.add_argument("--patience", type=int, default=config.PATIENCE)
+    parser.add_argument("--check-interval", type=int, default=config.CHECK_INTERVAL,
+                        help="Epochs between top-k accuracy checks")
+    args = parser.parse_args()
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    # ── Datasets ──────────────────────────────────────────────────────────────
+    train_ds = CardDataset(args.image_dir, get_controlled_augmentation(config.IMAGE_SIZE))
+    val_ds = CardDataset(args.image_dir, get_val_transforms(config.IMAGE_SIZE), rotations=[0])
+
+    indices = np.random.permutation(len(train_ds.images))
+    split = int(config.TRAIN_SPLIT * len(train_ds.images))
+    train_card_idx = set(indices[:split])
+    val_card_idx = set(indices[split:])
+
+    train_samples = [i for i, (c, _) in enumerate(train_ds.samples) if c in train_card_idx]
+    val_samples = [i for i, (c, _) in enumerate(val_ds.samples) if c in val_card_idx]
+
+    train_loader = DataLoader(
+        Subset(train_ds, train_samples),
+        batch_size=args.batch_size, shuffle=True,
+        num_workers=config.NUM_WORKERS, pin_memory=True, drop_last=True,
+    )
+    val_loader = DataLoader(
+        Subset(val_ds, val_samples),
+        batch_size=args.batch_size, shuffle=False,
+        num_workers=config.NUM_WORKERS, pin_memory=True,
+    )
+
+    num_classes = train_ds.get_num_classes()
+    print(f"Cards: {num_classes} | Train samples: {len(train_samples)} | Val samples: {len(val_samples)}")
+
+    # ── Model, loss, optimiser ─────────────────────────────────────────────────
+    model = CardNet(emb_dim=config.EMBEDDING_DIM).to(device)
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    print(f"Trainable parameters: {sum(p.numel() for p in trainable):,}")
+
+    criterion = CosFaceLoss(num_classes, config.EMBEDDING_DIM,
+                            config.COSFACE_SCALE, config.COSFACE_MARGIN).to(device)
+
+    optimizer = torch.optim.AdamW(
+        trainable + list(criterion.parameters()),
+        lr=args.lr, weight_decay=config.WEIGHT_DECAY,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
+
+    # ── Training loop ──────────────────────────────────────────────────────────
+    best_loss = float("inf")
+    patience_counter = 0
+    best_path = output_dir / "best_model.pth"
+
+    print("=" * 60)
+    for epoch in range(1, args.epochs + 1):
+        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, scaler, device)
+        val_loss = validate(model, val_loader, criterion, device)
+        scheduler.step()
+
+        print(f"Epoch {epoch:03d}/{args.epochs} | train={train_loss:.4f} val={val_loss:.4f}")
+
+        if val_loss < best_loss:
+            best_loss = val_loss
+            patience_counter = 0
+            torch.save(
+                {"epoch": epoch, "model_state_dict": model.state_dict(),
+                 "val_loss": val_loss, "num_classes": num_classes},
+                best_path,
+            )
+            print(f"  => Saved best model (val_loss={val_loss:.4f})")
+        else:
+            patience_counter += 1
+            if patience_counter >= args.patience:
+                print(f"\nEarly stopping after {epoch} epochs (patience={args.patience})")
+                break
+
+    print("=" * 60)
+    print(f"Done. Best val loss: {best_loss:.4f}")
+    print(f"Model saved to: {best_path}")
+    return str(best_path)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train FAB card embedding model")
-    parser.add_argument('--epochs', type=int, default=config.NUM_EPOCHS, help='Number of epochs')
-    parser.add_argument('--batch-size', type=int, default=config.BATCH_SIZE, help='Batch size')
-    parser.add_argument('--lr', type=float, default=config.LEARNING_RATE, help='Learning rate')
-    parser.add_argument('--patience', type=int, default=10, help='Early stopping patience')
-    parser.add_argument('--num-workers', type=int, default=config.NUM_WORKERS, help='Number of workers')
-    parser.add_argument('--image-size', type=int, default=config.IMAGE_SIZE, help='Image size')
-    
-    args = parser.parse_args()
-    
-    # Setup
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    
-    # Create directories
-    checkpoint_dir = Path(config.MODEL_SAVE_DIR)
-    checkpoint_dir.mkdir(exist_ok=True, parents=True)
-    Path(config.LOGS_DIR).mkdir(exist_ok=True, parents=True)
-    
-    # Create dataloaders
-    print("\nCreating dataloaders...")
-    train_loader, val_loader = create_dataloaders(
-        root_dir=config.IMAGE_DIR,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        image_size=args.image_size
-    )
-    
-    # Get number of classes
-    temp_dataset = FABCardDataset(config.IMAGE_DIR)
-    num_classes = temp_dataset.get_num_classes()
-    print(f"Number of unique cards: {num_classes}")
-    
-    # Create model
-    print("\nCreating model...")
-    model = create_model(
-        embedding_dim=config.EMBEDDING_DIM,
-        gem_p=config.GEM_P_INIT,
-        pretrained=True
-    )
-    model = model.to(device)
-    
-    # Freeze backbone
-    print("Freezing backbone parameters...")
-    for param in model.backbone.parameters():
-        param.requires_grad = False
-    
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Trainable parameters: {trainable_params:,} / {total_params:,}")
-    
-    # Create loss
-    criterion = ArcFaceLoss(
-        num_classes=num_classes,
-        embedding_dim=config.EMBEDDING_DIM,
-        scale=config.ARCFACE_SCALE,
-        margin=config.ARCFACE_MARGIN
-    ).to(device)
-    
-    # Create optimizer and scheduler
-    optimizer = optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=args.lr,
-        weight_decay=config.WEIGHT_DECAY
-    )
-    
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=args.epochs
-    )
-    
-    # Mixed precision training
-    scaler = GradScaler() if device.type == 'cuda' else None
-    if scaler:
-        print("Using mixed precision training (AMP)")
-    
-    # Tensorboard
-    writer = SummaryWriter(config.LOGS_DIR)
-    
-    # Early stopping
-    patience = args.patience
-    patience_counter = 0
-    print(f"Early stopping enabled with patience: {patience}")
-    
-    # Training loop
-    print("\nStarting training...")
-    print("=" * 60)
-    
-    best_val_loss = float('inf')
-    
-    for epoch in range(1, args.epochs + 1):
-        print(f"\nEpoch {epoch}/{args.epochs}")
-        
-        # Train
-        train_loss = train_epoch(
-            model, train_loader, criterion, optimizer, device, scaler
-        )
-        
-        # Validate
-        val_loss = validate(model, val_loader, criterion, device)
-        
-        # Step scheduler
-        scheduler.step()
-        
-        # Log to tensorboard
-        writer.add_scalar('Loss/train', train_loss, epoch)
-        writer.add_scalar('Loss/val', val_loss, epoch)
-        writer.add_scalar('LR', optimizer.param_groups[0]['lr'], epoch)
-        
-        print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
-        
-        # Save best model and check early stopping
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_counter = 0  # Reset patience
-            checkpoint = {
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': val_loss,
-                'train_loss': train_loss
-            }
-            torch.save(checkpoint, checkpoint_dir / 'best_model.pth')
-            print(f"✓ Saved best model (val_loss: {val_loss:.4f})")
-        else:
-            patience_counter += 1
-            print(f"  No improvement for {patience_counter} epoch(s)")
-            
-            # Early stopping check
-            if patience_counter >= patience:
-                print(f"\n⚠ Early stopping triggered! No improvement for {patience} epochs.")
-                print(f"Best validation loss: {best_val_loss:.4f} at epoch {epoch - patience}")
-                break
-        
-        # Save periodic checkpoint
-        if epoch % 10 == 0:
-            checkpoint = {
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': val_loss,
-                'train_loss': train_loss
-            }
-            torch.save(checkpoint, checkpoint_dir / f'checkpoint_epoch_{epoch}.pth')
-    
-    writer.close()
-    
-    print("\n" + "=" * 60)
-    print("Training complete!")
-    print(f"Best validation loss: {best_val_loss:.4f}")
-    print(f"Model saved to: {checkpoint_dir}")
+    main()
