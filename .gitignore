@@ -91,8 +91,11 @@ embeddings_cache/
 large_scale_checkpoints*/
 small_scale_checkpoints/
 
-# Card data (too large for git)
-fab_cards_data/
+# Card data (too large for git) — except the pHash JSON, which fab-card-id's
+# daily update-cards.yml keeps current here (~9 MB, rewritten only when new
+# printings appear).  A directory pattern can't be re-included, hence /*.
+fab_cards_data/*
+!fab_cards_data/card-flattened-with-phash.json
 *.db
 
 # Image data (never commit)
